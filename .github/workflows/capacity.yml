@@ -1,0 +1,105 @@
+name: Bicho Meu - distributed browser capacity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bichomeu-capacity
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      start: ${{ steps.schedule.outputs.start }}
+    steps:
+      - name: Fetch this exact public revision
+        shell: bash
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Verify result aggregation
+        run: python3 -m unittest -v test_aggregation.py
+      - name: Install official browser package
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/python -m playwright install --with-deps chromium
+      - name: One-session storefront smoke check
+        run: .venv/bin/python worker.py --smoke --output smoke-results
+      - name: Schedule synchronized start five minutes ahead
+        id: schedule
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,time
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              print('start='+str(int(time.time())+300),file=f)
+          PY
+
+  browsers:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: true
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - name: Fetch this exact public revision
+        shell: bash
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Install official browser package
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/python -m playwright install --with-deps chromium
+      - name: Run isolated browser sessions from this fixed origin
+        env:
+          SHARD: ${{ matrix.shard }}
+          START: ${{ needs.prepare.outputs.start }}
+        run: .venv/bin/python worker.py --shard "$SHARD" --shards 20 --start "$START"
+      - name: Preserve measurements even on a stopped test
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: worker-${{ matrix.shard }}
+          path: results/worker_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  aggregate:
+    needs: [prepare, browsers]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fetch this exact public revision
+        shell: bash
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: worker-*
+          path: measurements
+      - run: python3 aggregate.py measurements --expected 20
+      - uses: actions/upload-artifact@v6
+        with:
+          name: consolidated-result
+          path: distributed_result.json
+          retention-days: 7
